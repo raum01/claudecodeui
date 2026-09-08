@@ -150,12 +150,94 @@ open follow-up issues for whatever is left. Per `persist-work`.
 
 ## Verdicts
 
-Filled in as steps complete. Empty means not started.
+- **Step 0: blocked.** `gh auth status` reports no GitHub host logged in. The
+  fork cannot be created until the user runs `gh auth login`. The upstream is
+  already cloned into the working tree and branch `homelab/android-access`
+  exists off `upstream/main` @ `7015ffc`.
 
-- Step 0: pending — blocked on `gh auth login`
-- Step 1: pending
-- Step 2: pending
-- Step 3: pending
+- **Step 1: DONE, 2026-09-08 03:27 CDT.**
+  - P6 CONFIRMED: `dig +short cloudcli.rmz.sh` -> `192.168.0.184`. Wildcard
+    resolution is already in place, no DNS record had to be added.
+  - P5 live: certificate `notAfter=2026-10-08T23:27:01Z`,
+    `renewalTime=2026-09-08T23:27:01Z`. SANs are exactly `*.rmz.sh` and
+    `rmz.sh` (`openssl x509 -ext subjectAltName`).
+  - Traefik LoadBalancer confirmed at `192.168.0.184`, ports 80 and 443.
+  - Reachability from inside the cluster CONFIRMED: a throwaway pod got
+    `{"status":"ok",...}` from `http://192.168.0.43:3001/health`.
+  - R1 CONFIRMED AS A REAL RISK: `nmcli -g ipv4.method` on `netplan-eno1`
+    returns `auto`. The address is a lease, not a reservation. Not fixed;
+    needs a router change. `ollama-host` in `gpu-queue` hardcodes the same
+    address, so both break together.
+
+- **Step 2: DONE, 2026-09-08 03:38 CDT.** `https://cloudcli.rmz.sh` is live.
+  - Manifests live in the kuber repo, not this one:
+    `k8s/home-services/apps/cloudcli/` — selectorless Service, manual
+    EndpointSlice to `192.168.0.43:3001`, and two IngressRoutes.
+  - `curl -sI https://cloudcli.rmz.sh/health` -> `HTTP/2 200`, no `-k`.
+  - `curl -sI http://cloudcli.rmz.sh/health?q=1` -> `301` with
+    `Location: https://cloudcli.rmz.sh/health?q=1`, path and query preserved.
+  - R2 (WebSocket through the proxy) PARTIALLY CONFIRMED: an upgrade request
+    over HTTP/1.1 to `/ws` returns the same `401 Unauthorized` through Traefik
+    as it does straight to the backend, so the handshake reaches the app
+    unmangled and the refusal is CloudCLI's own missing-token check. A full
+    `101` needs a real JWT and is folded into step 3.
+  - `manifest.json` and `sw.js` both serve 200 over https, and the page links
+    the manifest at `/manifest.json`, which is root scope.
+
+### Review before applying (2026-09-08)
+
+GLM-5.3 reviewed the manifests. **The second reviewer, qwen3.8-max, was
+unavailable** — the Aliyun key answers 403 `AccessDenied.Unpurchased` on every
+model as of today, recorded in the `consulting-glm` skill. So this config was
+**looked at less**, which is not the same as fewer problems being present.
+
+Acted on:
+
+1. **Dropped `cloudcli.k8s.lan` from both routes.** Every other service in the
+   kuber repo answers both `.k8s.lan` and `.rmz.sh` from one rule, but the
+   attached secret covers `*.rmz.sh` only. The `.lan` name would have been
+   served a certificate it does not match, and the http route would have
+   redirected people into that error. A refused certificate is not a secure
+   context, which would have killed the service worker and push, the whole
+   point of the exercise. Confirmed against the secret's SANs.
+
+Refuted by measurement, and each mattered:
+
+2. "The frontend probably bakes in `http://host:3001`."
+   `curl -H 'Host: cloudcli.rmz.sh' http://192.168.0.43:3001/ | grep -E 'http://|ws://|:3001'` returns nothing.
+3. "Traefik may read `Endpoints` and not `EndpointSlice`, and see zero servers."
+   Traefik is v3.3.3 and it reads the slice: the route answered 200 within
+   seconds of apply. Worth noting because the repo's other off-cluster route
+   (`yacht-adsb/10-dump1090-edge.yaml`) does use the older `Endpoints` kind.
+4. "Traefik's default `respondingTimeouts.idleTimeout` of 180s will kill an
+   idle PTY." No `respondingTimeouts` flag is set, so the default does apply,
+   but the connection is never idle: CloudCLI's own WebSocket server pings
+   every 30 seconds (`server/modules/websocket/services/websocket-server.service.ts:25`,
+   `intervalMs = 30_000`) and terminates a socket that misses a pong. No
+   Traefik change needed, so the change stayed purely additive.
+5. "The app may pin `Host`/`Origin` on upgrade." It reads neither; the upgrade
+   handler takes the token from `?token=` or the `Authorization` header and
+   nothing else (`websocket-auth.service.ts:45-50`).
+6. "The manifest may sit at a subpath, silently breaking service-worker scope."
+   It is at `/manifest.json` with `"scope": "/"`.
+7. "The first LAN visitor could claim the account." Registration was already
+   closed before this went live: `/api/auth/status` returns
+   `{"needsSetup":false}`.
+
+Accepted as true, not fixed, and written into the app README as known rough
+edges:
+
+8. Nothing health-checks this backend. A static `ready: true` on the
+   EndpointSlice will keep claiming health while the process is dead.
+9. `cloudcli start` is a foreground npm process, not a systemd unit. A reboot
+   leaves the route pointing at nothing.
+10. Port 3001 remains open on `0.0.0.0`, so the TLS front door can be walked
+    around from inside the LAN.
+11. Whether the router forwards 443 to `192.168.0.184` is unverified from
+    here. If it does, this is a JWT-gated PTY on the public internet. **User
+    action.**
+
+- Step 3: pending — needs a phone
 - Step 4: pending
 - Step 5: pending
 
