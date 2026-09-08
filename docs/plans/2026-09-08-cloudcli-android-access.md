@@ -257,8 +257,91 @@ edges:
     here. If it does, this is a JWT-gated PTY on the public internet. **User
     action.**
 
-- Step 3: pending — needs a phone
-- Step 4: pending
+### Router and exposure, answered 2026-09-08 10:33 CDT
+
+The open question "does the router forward 443 inward" is now closed, from the
+router itself rather than from guesswork. It is a UniFi Cloud Gateway Ultra at
+192.168.0.1; the API key lives in secret `unifi-exporter` in namespace
+`monitoring`, and the recipe is already written up in the kuber repo at
+`docs/2026-08-17-plex-remote-access-unifi.md`.
+
+`GET /proxy/network/api/s/default/stat/portforward` returns exactly two rules,
+and that endpoint includes UPnP-created entries, not just hand-written ones:
+
+| state | name | outside | inside |
+|---|---|---|---|
+| enabled | Plex | any:32408 | 192.168.0.49:32400 |
+| **disabled** | Vaultwarden | any:8443 | 192.168.0.137:8443 |
+
+Nothing forwards 443. Nothing points at 192.168.0.184. **CloudCLI is not
+reachable from the internet.**
+
+One caveat that is true and worth keeping: UPnP is enabled
+(`upnp_enabled: true`, `upnp_nat_pmp_enabled: true`) with secure mode on
+(`upnp_secure_mode: true`). Secure mode confines a device to opening ports to
+its own address, so nothing on the LAN can point a forward at the Traefik
+gateway, and no process lives at 192.168.0.184 to ask for one anyway. But the
+exposure surface is not only the static table, and a future device could open a
+port for itself without anyone approving it.
+
+### Public DNS: the name resolves outside, the address does not route
+
+`dig @1.1.1.1 cloudcli.rmz.sh` and `dig @8.8.8.8 cloudcli.rmz.sh` both return
+`192.168.0.184`. The wildcard is published in Cloudflare, pointing at an RFC1918
+address, so the whole internet can learn the mapping and none of it can use it.
+
+This kills a real worry from the review: a phone with Private DNS (DNS-over-TLS)
+bypasses Pi-hole, and the fear was that the name would then not resolve at all.
+It resolves either way, because it is in public DNS. On the LAN it reaches
+Traefik; off the LAN it resolves to an address that goes nowhere, which is a
+clean failure rather than a confusing one.
+
+- **Step 3: PARTLY DONE without a phone, 2026-09-08 10:34-10:39 CDT.**
+
+  What was proven by machine:
+
+  - **Chrome's own installability check passes.** Lighthouse 11.7.1 against
+    https://cloudcli.rmz.sh/ scores `installable-manifest` OK, along with
+    `splash-screen`, `themed-omnibox`, `maskable-icon`, `content-width` and
+    `viewport`. That audit is Chrome's real installability verdict over CDP,
+    the same one that decides whether Android offers "Install app". Note for
+    next time: Lighthouse 12 removed the PWA category entirely, so the audit
+    has to be run with `lighthouse@11`.
+  - **The WebSocket path is fully confirmed**, upgrading R2 from partial. A
+    short-lived token was minted locally from the server's own `jwt_secret`
+    (`app_config` table in `~/.cloudcli/auth.db`), used, and destroyed. With it:
+    `wss://cloudcli.rmz.sh/ws` returned **101 Switching Protocols in 38 ms**,
+    the socket opened, and a live `session_upserted` event arrived through it.
+    `wss://cloudcli.rmz.sh/shell` also returned 101 and held open. REST through
+    the proxy: `/api/auth/user` 200, `/api/projects` 200.
+
+  What still needs the physical phone, and cannot be faked:
+
+  - that web push actually arrives on that specific device, with its specific
+    battery optimiser;
+  - that the home screen icon and splash look right on that screen.
+
+- **Step 4: IN PROGRESS.**
+
+  - Signing key created 2026-09-08 10:37 CDT:
+    `~/.android-keystores/cloudcli-twa.keystore`, alias `cloudcli`, RSA 4096,
+    valid until 2054. Password in `~/.android-keystores/cloudcli-twa.credentials`
+    (mode 600). **This file is the only thing that can ever update the app; if
+    it is lost the app can only be replaced, not upgraded. It belongs in
+    Bitwarden.** The vault was locked, so it could not be put there
+    automatically.
+  - SHA-256: `3B:95:85:B4:7E:D6:73:2A:9E:7A:A2:1D:C4:B2:4E:5B:40:9A:52:74:09:3E:52:37:33:60:3B:8B:87:88:70:A8`
+  - Package name pinned to `sh.rmz.cloudcli`.
+  - **Asset links are live.** `https://cloudcli.rmz.sh/.well-known/assetlinks.json`
+    returns 200 with `content-type: application/json`, served by a two-replica
+    nginx in the cluster (`kuber` commit `b51ebe0`). It needed its own route
+    because CloudCLI answers unknown paths with its SPA index page, so Android
+    would have received HTML where it expects JSON. Verified afterwards that the
+    site, `/health` and `/manifest.json` still return 200 and that a
+    neighbouring `/.well-known/` path still falls through to the app.
+  - APK build and an Android emulator to install it on are running as separate
+    jobs. Results pending.
+
 - Step 5: pending
 
 ## What this plan deliberately does not do
