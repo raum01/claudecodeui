@@ -147,3 +147,11 @@ tasks/
 cloudcli-sidebar-app-source.tar.gz
 cloudcli-sidebar.html
 electron/*.tar.gz
+
+# Android TWA wrapper (built with bubblewrap) — never commit keys or build output
+android-twa/
+*.keystore
+*.jks
+*.credentials
+*.apk
+*.aab
