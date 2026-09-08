@@ -1,0 +1,127 @@
+You are reviewing a Kubernetes/Traefik config change in a K3s homelab before it
+is applied to a live cluster. Be a prosecutor, not an oracle.
+
+## Context, all measured 2026-09-08 03:22-03:30 CDT
+
+- CloudCLI UI (fork of github.com/siteboon/claudecodeui, npm @cloudcli-ai/cloudcli
+  v1.37.2) runs as a plain npm process on a workstation at 192.168.0.43, listening
+  0.0.0.0:3001, plain HTTP only (server/index.ts:85 is http.createServer, no https
+  anywhere in server/). Verified: curl http://127.0.0.1:3001/health -> 200.
+- It is NOT a pod and will not become one: it exists to read/write ~/.claude and
+  project files on that host.
+- The cluster's Traefik LoadBalancer is at 192.168.0.184 (ports 80, 443).
+- Pi-hole resolves *.rmz.sh -> 192.168.0.184. Verified: dig +short cloudcli.rmz.sh
+  -> 192.168.0.184.
+- Namespace `home` already holds secret wildcard-rmz-sh-tls (57d, Let's Encrypt
+  wildcard *.rmz.sh via Cloudflare DNS-01, notAfter 2026-10-08) and Middleware
+  redirect-https (16d).
+- From inside a cluster pod, curl http://192.168.0.43:3001/health returns 200.
+- Cluster lesson already recorded in this repo: an IngressRoute that sets a `tls`
+  block answers plain HTTP with Traefik's own 404, so http and https must be two
+  separate routes with a redirect middleware on the http one.
+- The app needs three WebSocket paths to work: /ws (chat), /shell (a real PTY on
+  the workstation) and /plugin-ws/* (proxy to a plugin's own ws server). It also
+  serves a PWA manifest + service worker, and web push via VAPID.
+- Goal of the change: serve it at https://cloudcli.rmz.sh so an Android phone can
+  install it as a PWA (Chrome refuses service workers and web push over plain
+  http), and later wrap it as a TWA.
+- Auth: CloudCLI single-user login, registration closes after the first user,
+  JWT valid 7 days. No forward-auth in front, deliberately, because WebSocket
+  clients and a TWA cannot complete an interactive SSO redirect.
+- 192.168.0.43 is a DHCP lease (nmcli ipv4.method = auto), not a reservation.
+- kubectl diff shows the change is purely additive: 4 new objects, nothing
+  existing modified.
+
+## The manifests
+
+--- service.yaml ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudcli
+  namespace: home
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3001
+      targetPort: 3001
+      protocol: TCP
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: cloudcli-static
+  namespace: home
+  labels:
+    kubernetes.io/service-name: cloudcli
+addressType: IPv4
+ports:
+  - name: http
+    port: 3001
+    protocol: TCP
+endpoints:
+  - addresses:
+      - 192.168.0.43
+    conditions:
+      ready: true
+
+--- ingressroute.yaml ---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: cloudcli-http
+  namespace: home
+spec:
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      match: Host(`cloudcli.k8s.lan`) || Host(`cloudcli.rmz.sh`)
+      middlewares:
+        - name: redirect-https
+          namespace: home
+      services:
+        - name: cloudcli
+          port: 3001
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: cloudcli
+  namespace: home
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`cloudcli.k8s.lan`) || Host(`cloudcli.rmz.sh`)
+      services:
+        - name: cloudcli
+          port: 3001
+  tls:
+    secretName: wildcard-rmz-sh-tls
+
+## Questions. Answer each separately and concretely.
+
+1. Name an invariant this configuration RELIES ON but does NOT ENFORCE. For each
+   one, say what breaks and how it would be observed.
+
+2. Name the assumption most likely to be wrong here, and the single cheapest
+   experiment that would refute it. Prefer a command I can run.
+
+3. Specifically: will long-lived WebSocket connections (/ws, /shell) survive this
+   path? Traefik default timeouts, buffering, EndpointSlice to an off-cluster IP,
+   the redirect middleware. If there is a concrete default that kills them, name
+   the setting and its default value; if you do not know the value, say you do not
+   know rather than guessing a number.
+
+4. Does anything here silently degrade the PWA / service-worker / web-push story
+   on Android? Think about the Host header the backend sees, absolute URLs the
+   frontend builds, the WebSocket URL derived from window.location, and manifest
+   scope.
+
+5. Anything else that is actually wrong, as opposed to stylistically different.
+
+Do not invent measured numbers. If a claim needs a measurement I have not given
+you, say so and name the command.
