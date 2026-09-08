@@ -395,6 +395,74 @@ clean failure rather than a confusing one.
     structural precondition lines up, but Digital Asset Links is verified at
     runtime on the device, so only a real launch settles it.
 
+### Installed and seen running, 2026-09-08 10:57 CDT — no phone involved
+
+An Android 14 emulator (Google Play image, x86_64, Chrome 113) was stood up under
+KVM, and the APK went onto it:
+
+```
+adb install -r cloudcli-1.0.0.apk        -> Success
+pm list packages                          -> sh.rmz.cloudcli
+dumpsys package                           -> versionName=1.0.0
+                                             firstInstallTime=2026-09-08 10:57:05
+topResumedActivity  com.android.chrome/org.chromium.chrome.browser.customtabs.CustomTabActivity
+```
+
+Screenshot: `android-twa/evidence/c0-twa-01-launched.png`. It shows CloudCLI's
+login page filling the screen with **no browser address bar**. That is the whole
+proof: the address bar only disappears when Android has fetched
+`/.well-known/assetlinks.json`, matched it against the certificate the APK is
+signed with, and accepted the pair. Both halves were checked separately before;
+this is them agreeing on a real device.
+
+That the foreground activity is Chrome's own `CustomTabActivity` is the expected
+shape for a TWA rather than a defect. The app does not carry a browser engine; it
+borrows the installed Chrome. Consequence worth remembering: the installed PWA
+and the APK share one storage, one service worker and one push subscription, so
+logging in once covers both.
+
+Emulator lives on: `android-twa/emulator.sh` with `start`, `stop`, `status`.
+Serial `emulator-5554`, SDK at `~/Android/Sdk` (4.2 GB). One trap recorded there:
+Play-store images set `ro.adb.secure=1`, so `adb start-server` must run BEFORE
+the emulator boots, otherwise no adb key is injected into userdata and the device
+comes up permanently `unauthorized` with no dialog to click in headless mode.
+
+Also settled by this run: the emulator reached the site over the LAN with no DNS
+help, and Chrome inside the guest reported "Connection is secure", issuer
+`CN=YR2, O=Let's Encrypt`, TLS 1.3. The device-side certificate SHA-256 matches
+the host-side `openssl` output byte for byte, so nothing is intercepting.
+
+Minor, cosmetic: a freshly installed app greets you with a red
+"Your session expired. Please log in again." banner although no session ever
+existed. Looks like a fault where there is none.
+
+## Two things that are not this plan's fault and outlive it
+
+**Version drift on the workstation.** Measured 2026-09-08 10:54 CDT: the global
+npm package is **1.37.3** while the running server reports **1.37.2**, and its
+process has been up since Sep 7 21:22, so it never restarted after the install
+landed (directory mtime 10:43 today). Neither this session nor the two peer
+sessions asked about it admit to running it. The consequence stands on its own:
+the next restart from any cause, including a crash or a power cut, silently moves
+every project onto a version nobody chose. This argues for a deliberate restart
+soon rather than an accidental one later.
+
+**Two Claude sessions built this same thing in parallel today.** `claudecodeui-c0`
+(this record) and `claudecodeui-ac` both worked the Android thread in this repo,
+each with its own subagents. They collided concretely: something other than this
+session's agent was driving `emulator-5554`, backgrounded Chrome mid-run and
+removed one of its screenshots. Authorship of commits `3b9c708` and `450e791`
+could not be established — `claudecodeui-ac` claims every commit on the branch,
+including five that this session's own record shows it making, and this session's
+emulator agent denies the two in question and points at the APK agent. The
+contents of both were verified and are correct, so nothing was reverted. Recorded
+because the wasted duplicate effort is the real cost, not the attribution.
+
+**A gitignore rule that is broader than its comment.** `.gitignore:152` ignores
+`android-twa/` wholesale, which also hides `emulator.sh` and every screenshot, not
+only keys and build output. `git check-ignore -v android-twa/emulator.sh`
+confirms. Narrowing it is a follow-up.
+
 - Step 5: pending
 
 ## What this plan deliberately does not do
