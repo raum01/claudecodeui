@@ -339,8 +339,61 @@ clean failure rather than a confusing one.
     would have received HTML where it expects JSON. Verified afterwards that the
     site, `/health` and `/manifest.json` still return 200 and that a
     neighbouring `/.well-known/` path still falls through to the app.
-  - APK build and an Android emulator to install it on are running as separate
-    jobs. Results pending.
+  - **APK BUILT AND VERIFIED, 2026-09-08 10:48 CDT.**
+
+    ```
+    android-twa/dist/cloudcli-1.0.0.apk
+    963014 bytes
+    sha256 2c3699eed5f20769bd23e87666504dc79859a46fbe942388b68399594fa42044
+    ```
+
+    Built with `@bubblewrap/cli@1.25.0`. Verified independently of the agent
+    that produced it, not taken on its word:
+
+    - `file` reports an Android package with an APK Signing Block.
+    - `apksigner verify --print-certs` gives
+      `3b9585b47ed6732a9e7aa21dc4b24e5b409a5274093e523733603b8b878870a8`,
+      signed by `CN=CloudCLI Homelab`, RSA 4096, v1+v2+v3 schemes.
+    - That fingerprint was compared against the file actually being served at
+      https://cloudcli.rmz.sh/.well-known/assetlinks.json, fetched live, along
+      with the package name. Both match. This is the pair that decides whether
+      the address bar disappears, so it was checked end to end rather than
+      assumed from two files that were written by the same hand.
+
+    Package `sh.rmz.cloudcli`, versionName 1.0.0, versionCode 1, minSdk 21,
+    targetSdk 36. Launcher is `sh.rmz.cloudcli.LauncherActivity` extending
+    androidbrowserhelper's TWA LauncherActivity, with `fallbackType` set to
+    `customtabs`, so it is a real Trusted Web Activity rather than a WebView
+    with an icon.
+
+    Worth recording for whoever rebuilds this: bubblewrap's `init` insists on
+    being interactive, and it hard-requires JDK 17 while this machine runs 21.
+    The way around both is two small scripts left beside the project,
+    `generate-twa-manifest.js` and `generate-twa-project.js`, which call the
+    same library functions `init` does. The toolchain lives under
+    `~/.bubblewrap`, deliberately away from `~/Android`.
+
+    One residue that is bubblewrap's design rather than ours: during signing
+    the keystore passwords are visible in the `apksigner` process arguments to
+    anything running `ps` on this box.
+
+  - **Two cosmetic decisions left to the user, neither blocking:**
+    1. The splash and status bar are `#FFFFFF`, taken from the live web
+       manifest, which hardcodes `theme_color: #ffffff` in `index.html:31`. The
+       app picks light or dark in the browser (`darkMode: ["class"]` in
+       `tailwind.config.js`), so the server cannot tell which is in use. If the
+       UI runs dark, every launch will flash white. A rebuild with a dark
+       splash is a few minutes.
+    2. `enableNotifications` is on, which adds the `POST_NOTIFICATIONS`
+       permission and a delegation service. That is wanted here, since push is
+       half the point of having an app.
+
+  - Emulator to install it on: still being set up.
+
+  - **Not proven, and it is the one thing that matters most:** nobody has
+    installed this APK and watched it open without a browser address bar. Every
+    structural precondition lines up, but Digital Asset Links is verified at
+    runtime on the device, so only a real launch settles it.
 
 - Step 5: pending
 
