@@ -407,7 +407,7 @@ test('untracked work expires only after its lease and the normal idle timeout', 
 });
 
 test('automatic untracked activity renews the lease and exit cancels it', async (t) => {
-  await withRun(async ({ script, sent, done }) => {
+  await withRun(async ({ script, sent }) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const drain = () => new Promise<void>((resolve) => setImmediate(resolve));
     script.emit(init());
@@ -423,7 +423,10 @@ test('automatic untracked activity renews the lease and exit cancels it', async 
     assert.equal(script.released(), false, 'automatic activity renewed the unknown-work lease');
     assert.equal(sent.some((message) => message.kind === 'status' && message.text?.includes('silent for 24 hours')), false);
     script.end();
-    await done;
+    // The run's promise settles with its turn, not with the process, so
+    // wait for the process loop itself to wind down and close stdin.
+    for (let i = 0; i < 50 && !script.released(); i++) await drain();
+    assert.equal(script.released(), true);
     const messagesAtExit = sent.length;
     t.mock.timers.tick(48 * 60 * 60 * 1000);
     await drain();

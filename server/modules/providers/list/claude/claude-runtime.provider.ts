@@ -58,6 +58,10 @@ type LiveSession = {
   writer: SessionWriter | null;
   releaseInput: (() => void) | null;
   closeSubmissions?: () => void;
+  /** False once the CLI's stdin has ended: a control request written after that is dropped by the SDK. */
+  inputOpen?: () => boolean;
+  /** Settles once the CLI process behind this entry has exited and its run loop has wound down. */
+  exited?: Promise<void>;
   submit?: (command: string, options: AnyRecord, writer: ProviderRuntimeWriter) => Promise<unknown>;
 };
 
@@ -848,8 +852,39 @@ async function loadMcpConfig(cwd: string) {
   }
 }
 
+// How long a CLI that was asked to exit (its stdin closed) may take to do so
+// before it is killed. Only an idle process is ever asked to exit for a
+// restart, and it normally goes within a second or two; the grace covers MCP
+// servers and hooks shutting down, not work.
+const PROCESS_EXIT_GRACE_MS = 10 * 1000;
+
+// How long Stop waits for the CLI to confirm an interrupt. The process is
+// closed right after either way; the wait only lets a responsive CLI end its
+// turn cleanly, and a CLI that never answers must not keep Stop from working.
+const INTERRUPT_ANSWER_TIMEOUT_MS = 5 * 1000;
+
+/** Whether `promise` settled within `ms`; a later rejection is left to the caller's own handler. */
+async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
- * Used by the provider registry to submit a turn to a persistent SDK session.
+ * Used by the provider registry (chat turns, scheduled messages) and by the
+ * agent and git routes to run one turn of a Claude conversation.
+ *
+ * Settles when that turn completes, fails, or is refused, not when the CLI
+ * process behind it exits: the process outlives the turn to take the
+ * conversation's next one, and callers that wait for a turn's outcome (the
+ * agent API, commit-message generation, the scheduled-message dispatcher)
+ * must not wait out its idle timeout.
  * @param {string} command - User prompt/command
  * @param {Object} options - Query options
  * @param {Object} ws - WebSocket connection
@@ -857,6 +892,27 @@ async function loadMcpConfig(cwd: string) {
  * @returns {Promise<void>}
  */
 export async function queryClaudeSDK(command: string, options: AnyRecord, ws: ProviderRuntimeWriter, context: ProviderRuntimeContext) {
+  let settleInitialTurn: () => void = () => {};
+  const initialTurn = new Promise<void>((resolve) => { settleInitialTurn = resolve; });
+  const processRun = runClaudeProcess(command, options, ws, context, settleInitialTurn);
+  await Promise.race([initialTurn, processRun]);
+}
+
+/**
+ * Starts a CLI process for a conversation, or hands the turn to the one
+ * already live for it, and drives that process until it exits.
+ *
+ * Resolves when the process has exited. `settleInitialTurn` is called once
+ * the turn this call started has completed, which is what `queryClaudeSDK`
+ * waits for.
+ */
+async function runClaudeProcess(
+  command: string,
+  options: AnyRecord,
+  ws: ProviderRuntimeWriter,
+  context: ProviderRuntimeContext,
+  settleInitialTurn: () => void,
+) {
   const { sessionId } = options;
   let sessionSummary = options.sessionSummary;
   // Callers pass the stable app session id; the SDK only understands the
@@ -928,7 +984,22 @@ export async function queryClaudeSDK(command: string, options: AnyRecord, ws: Pr
   };
   const scheduleRelease = () => {
     cancelIdleRelease();
-    if (!turnCompleteSent || backgroundWork.hasOutstanding(sessionKey()) || untrackedWorkPending || automaticTurnPending) return;
+    if (!turnCompleteSent) return;
+    const holdsWork = backgroundWork.hasOutstanding(sessionKey()) || untrackedWorkPending || automaticTurnPending;
+    // A run without an app session id (commit-message generation) can never
+    // be handed another turn, since nothing can address it, so there is
+    // nothing to idle for: let the CLI exit now, as every turn used to. Its
+    // background work gets the idle timeout as a ceiling rather than no limit,
+    // because nobody can see or stop that work from the UI.
+    if (!sessionId) {
+      if (!holdsWork) {
+        closing = true;
+        releasePromptStream();
+        return;
+      }
+    } else if (holdsWork) {
+      return;
+    }
     idleReleaseTimer = setTimeout(() => {
       idleReleaseTimer = null;
       closing = true;
@@ -1046,6 +1117,9 @@ export async function queryClaudeSDK(command: string, options: AnyRecord, ws: Pr
       }
 
       const requestId = createRequestId();
+      // The prompt's retraction has to reach the stream that showed it, even
+      // if a later turn has taken the conversation's writer over meanwhile.
+      const requestWriter = ws;
       ws.send(createNormalizedMessage({ kind: 'permission_request', requestId, toolName, input, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
       emitNotification(createNotificationEvent({
         provider: 'claude',
@@ -1070,7 +1144,7 @@ export async function queryClaudeSDK(command: string, options: AnyRecord, ws: Pr
           _receivedAt: new Date(),
         },
         onCancel: (reason: string) => {
-          ws.send(createNormalizedMessage({ kind: 'permission_cancelled', requestId, reason, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
+          requestWriter.send(createNormalizedMessage({ kind: 'permission_cancelled', requestId, reason, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
         }
       });
       if (!decision) {
@@ -1086,7 +1160,7 @@ export async function queryClaudeSDK(command: string, options: AnyRecord, ws: Pr
       // the inbound socket only, so without this a mid-run page refresh
       // replays the `permission_request` with nothing to retract it and the
       // already-answered prompt resurrects.
-      ws.send(createNormalizedMessage({ kind: 'permission_resolved', requestId, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
+      requestWriter.send(createNormalizedMessage({ kind: 'permission_resolved', requestId, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
 
       if (decision.allow) {
         if (decision.rememberEntry && typeof decision.rememberEntry === 'string') {
@@ -1154,6 +1228,8 @@ export async function queryClaudeSDK(command: string, options: AnyRecord, ws: Pr
       });
       const session = getSession(sessionKey())!;
       session.closeSubmissions = () => { closing = true; cancelIdleRelease(); };
+      session.inputOpen = () => !heldPrompt.closed;
+      session.exited = processClosed;
       session.submit = async (nextCommand: string, nextOptions: AnyRecord, nextWriter: ProviderRuntimeWriter) => {
         const refuse = (content: string) => {
           nextWriter.send(createNormalizedMessage({ kind: 'error', content, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
@@ -1170,7 +1246,18 @@ export async function queryClaudeSDK(command: string, options: AnyRecord, ws: Pr
           closing = true;
           cancelIdleRelease();
           releasePromptStream();
-          await processClosed;
+          // The replacement must not start while this process is still up:
+          // two CLIs resuming one transcript is the failure this runtime
+          // exists to prevent. An idle CLI exits on EOF; one that does not is
+          // killed after the grace period.
+          if (!await settlesWithin(processClosed, PROCESS_EXIT_GRACE_MS)) {
+            console.warn('[Claude SDK] CLI did not exit after stdin closed; closing it before restart for session:', sessionKey());
+            try { queryInstance?.close?.(); } catch (error) { console.warn('Error closing Claude query:', error); }
+            await processClosed;
+          }
+          // An abort that landed while the old process was winding down
+          // cancelled this turn too; the abort handler already completed it.
+          if (session.status === 'aborted') return;
           return queryClaudeSDK(nextCommand, nextOptions, nextWriter, context);
         }
         // Reserve before attachment I/O so a second sender cannot enter or the
@@ -1313,6 +1400,7 @@ export async function queryClaudeSDK(command: string, options: AnyRecord, ws: Pr
             stopReason: 'completed'
           });
           settleTurn?.();
+          settleInitialTurn();
         } else if (heldForBackgroundWork && !abortPending && !stillOutstanding) {
           // A result after the turn already reported complete means the work we
           // held the process open for has finished and pushed a follow-up turn
@@ -1457,21 +1545,52 @@ export async function abortClaudeSDKSession(sessionId: string) {
   }
 
   abortedInstances.add(session.instance);
+  const inputOpen = session.inputOpen?.() ?? true;
   session.closeSubmissions?.();
+  let interrupted = true;
   try {
-    await session.instance.interrupt();
-    return true;
+    // After stdin has ended the SDK drops the interrupt request, and its
+    // promise would stay pending until the process exits on its own, so the
+    // close below is the only stop that can reach it.
+    if (inputOpen) {
+      const interrupting = session.instance.interrupt();
+      interrupting.catch(() => {});
+      if (!await settlesWithin(interrupting, INTERRUPT_ANSWER_TIMEOUT_MS)) {
+        console.warn(`[Claude SDK] Interrupt not answered within ${INTERRUPT_ANSWER_TIMEOUT_MS} ms; closing session ${sessionId}`);
+      }
+    }
   } catch (error) {
     console.error(`Error interrupting session ${sessionId}:`, error);
-    return false;
-  } finally {
-    // Dispose even if interrupt fails: an aborted session must not retain a
-    // process, MCP servers, pending permissions, or an input consumer.
-    session.releaseInput?.();
-    try { session.instance.close?.(); } catch (error) { console.warn('Error closing Claude query:', error); }
-    session.status = 'aborted';
-    if (getSession(sessionId) === session) removeSession(sessionId);
+    interrupted = false;
   }
+  // Dispose even if interrupt fails: an aborted session must not retain a
+  // process, MCP servers, pending permissions, or an input consumer.
+  session.releaseInput?.();
+  try { session.instance.close?.(); } catch (error) { console.warn('Error closing Claude query:', error); }
+  session.status = 'aborted';
+  // Keep the entry until the process is gone, so a message sent right after
+  // Stop is refused ("closing") rather than started next to a CLI that is
+  // still shutting down. A process that outlives the grace period is let go
+  // with a warning instead of blocking the conversation forever.
+  //
+  // Not awaited: the caller emits the aborted `complete` as soon as this
+  // returns, and it has to beat the run's own promise, which settles when
+  // the closed process winds down and would otherwise report the turn as a
+  // plain failure.
+  const forget = () => {
+    if (getSession(sessionId) === session) removeSession(sessionId);
+  };
+  if (session.exited) {
+    void settlesWithin(session.exited, PROCESS_EXIT_GRACE_MS).then((exited) => {
+      if (!exited) {
+        console.warn(`[Claude SDK] CLI for session ${sessionId} still running ${PROCESS_EXIT_GRACE_MS} ms after close`);
+      }
+      forget();
+    });
+  } else {
+    forget();
+  }
+  return interrupted;
 }
 
 /**
