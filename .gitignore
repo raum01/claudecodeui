@@ -148,8 +148,19 @@ cloudcli-sidebar-app-source.tar.gz
 cloudcli-sidebar.html
 electron/*.tar.gz
 
-# Android TWA wrapper (built with bubblewrap) — never commit keys or build output
-android-twa/
+# Android TWA wrapper (built with bubblewrap). Only the sources that regenerate
+# it are tracked; the Gradle project, node_modules, build output, screenshots
+# and anything else that appears here stay ignored by default. Keys never live
+# in this directory.
+/android-twa/*
+!/android-twa/README.md
+!/android-twa/build.sh
+!/android-twa/emulator.sh
+!/android-twa/generate-twa-manifest.js
+!/android-twa/generate-twa-project.js
+!/android-twa/package.json
+!/android-twa/package-lock.json
+!/android-twa/twa-manifest.json
 *.keystore
 *.jks
 *.credentials
