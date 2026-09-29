@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Notification } from 'electron';
@@ -77,6 +78,10 @@ export class DesktopNotificationsController {
     this.openNotificationTarget = openNotificationTarget;
     this.onChange = onChange;
     this.settings = { enabled: false };
+    // Identifies this installation to servers that are not reached through a
+    // cloudcli.ai account (a self-hosted server). Persisted with the settings
+    // so every launch reuses one notification endpoint instead of adding one.
+    this.installationDeviceId = null;
     this.connections = new Map();
     this.lastEvent = null;
     this.lastError = null;
@@ -101,15 +106,39 @@ export class DesktopNotificationsController {
     };
   }
 
+  getInstallationDeviceId() {
+    return this.installationDeviceId;
+  }
+
   async loadSettings() {
+    let stored = null;
     try {
-      const raw = await fs.readFile(this.settingsPath, 'utf8');
-      const stored = JSON.parse(raw);
-      this.settings = { enabled: Boolean(stored.enabled) };
+      stored = JSON.parse(await fs.readFile(this.settingsPath, 'utf8'));
     } catch {
-      this.settings = { enabled: false };
+      stored = null;
+    }
+    this.settings = { enabled: Boolean(stored?.enabled) };
+    if (typeof stored?.installationDeviceId === 'string' && stored.installationDeviceId) {
+      this.installationDeviceId = stored.installationDeviceId;
+    } else {
+      this.installationDeviceId = crypto.randomUUID();
+      try {
+        await this.writeSettings();
+      } catch (error) {
+        // A read-only or full profile must not stop the app from starting. The id
+        // then lives for this run only, and the next launch mints another.
+        this.lastError = `Could not save notification settings: ${error instanceof Error ? error.message : String(error)}`;
+      }
     }
     return this.settings;
+  }
+
+  async writeSettings() {
+    await fs.mkdir(path.dirname(this.settingsPath), { recursive: true });
+    await fs.writeFile(this.settingsPath, JSON.stringify({
+      ...this.settings,
+      installationDeviceId: this.installationDeviceId,
+    }, null, 2), 'utf8');
   }
 
   async saveSettings(next) {
@@ -118,8 +147,7 @@ export class DesktopNotificationsController {
       await this.disableCurrentTargets();
     }
     this.settings = { enabled };
-    await fs.mkdir(path.dirname(this.settingsPath), { recursive: true });
-    await fs.writeFile(this.settingsPath, JSON.stringify(this.settings, null, 2), 'utf8');
+    await this.writeSettings();
     await this.sync();
     this.onChange?.();
     return this.settings;
@@ -207,7 +235,7 @@ export class DesktopNotificationsController {
         await this.registerTarget(target.httpUrl);
         ws.send(JSON.stringify({
           type: 'register',
-          deviceId: this.getDeviceId?.(),
+          deviceId: this.getDeviceId?.(target.httpUrl),
           label: this.getAccountEmail?.() || this.appName,
           platform: process.platform,
           appVersion: this.appVersion,
@@ -240,7 +268,7 @@ export class DesktopNotificationsController {
       headers: await this.getTargetAuthHeaders(httpUrl),
       body: {
         channel: 'desktop',
-        endpointId: this.getDeviceId?.(),
+        endpointId: this.getDeviceId?.(httpUrl),
         label: this.getAccountEmail?.() || this.appName,
         metadata: {
           platform: process.platform,
@@ -252,15 +280,14 @@ export class DesktopNotificationsController {
   }
 
   async disableCurrentTargets() {
-    const deviceId = this.getDeviceId?.();
-    if (!deviceId) return;
-
     const targets = new Set([
       ...[...this.connections.values()].map((connection) => connection.httpUrl).filter(Boolean),
       ...(this.getRunningEnvironmentUrls?.() || []),
     ]);
 
     const results = await Promise.allSettled([...targets].map(async (httpUrl) => {
+      const deviceId = this.getDeviceId?.(httpUrl);
+      if (!deviceId) return;
       const url = new URL(`/api/notifications/endpoints/desktop/${encodeURIComponent(deviceId)}`, httpUrl).toString();
       await requestJson(url, {
         method: 'PATCH',

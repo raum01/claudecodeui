@@ -7,6 +7,7 @@ import { CloudController } from './cloud.js';
 import { DesktopWindowManager } from './desktopWindow.js';
 import { DesktopNotificationsController } from './desktopNotifications.js';
 import { LocalServerController } from './localServer.js';
+import { getSelfHostedOrigins, probeSelfHostedServer, resolveSelfHostedServer } from './selfHostedServer.js';
 import { TabsController } from './tabs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,6 +31,9 @@ let desktopWindow = null;
 let localServer = null;
 let cloud = null;
 let desktopNotifications = null;
+let selfHostedServer = null;
+let selfHostedServerError = null;
+let selfHostedOpenInFlight = null;
 let isQuitting = false;
 let isRefreshingCloud = false;
 let pendingCloudConnectStartedAt = 0;
@@ -70,6 +74,39 @@ function getRunningEnvironmentUrls() {
     .filter((environment) => environment.status === 'running')
     .map((environment) => cloud.getEnvironmentUrl(environment))
     .filter(Boolean);
+}
+
+/** Servers that native notifications connect to: the self-hosted one first. */
+function getNotificationTargetUrls() {
+  return [...getSelfHostedOrigins(selfHostedServer), ...getRunningEnvironmentUrls()];
+}
+
+/**
+ * The endpoint id this app registers under on a given server. The self-hosted
+ * server always gets the persisted installation id, so connecting or dropping a
+ * cloudcli.ai account never re-registers it under a second id. Cloud targets keep
+ * upstream's behaviour: the cloud account's device id.
+ */
+function getNotificationDeviceId(httpUrl) {
+  const installationId = desktopNotifications?.getInstallationDeviceId() || '';
+  if (httpUrl && isSelfHostedUrl(httpUrl)) return installationId;
+  const cloudAccount = cloud.getAccount();
+  if (cloudAccount?.apiKey) return cloudAccount.deviceId || '';
+  return installationId;
+}
+
+function getSelfHostedState() {
+  if (!selfHostedServer) {
+    return { configured: false, error: selfHostedServerError };
+  }
+  return {
+    configured: true,
+    url: selfHostedServer.url,
+    name: selfHostedServer.name,
+    source: selfHostedServer.source,
+    loaded: Boolean(desktopWindow?.isTargetLoaded(getSelfHostedTarget())),
+    error: null,
+  };
 }
 
 function getDisplayTargetName() {
@@ -129,6 +166,7 @@ function getDesktopState() {
     activeTabId: tabs.activeTabId,
     environments: cloud.getEnvironments().map(serializeEnvironment),
     desktopNotifications: desktopNotifications?.getState() || { enabled: false, supported: false, connectedCount: 0, targetCount: 0 },
+    selfHostedServer: getSelfHostedState(),
   };
 }
 
@@ -239,6 +277,7 @@ function getDiagnosticsText() {
     cloudAuthState: cloud.getAuthState(),
     cloudAccountPath: getStorePath(),
     controlPlaneUrl: CLOUDCLI_CONTROL_PLANE_URL,
+    selfHostedServer: getSelfHostedState(),
   }, null, 2);
 }
 
@@ -563,6 +602,102 @@ async function openLocalInDesktop() {
   return getDesktopState();
 }
 
+function getSelfHostedTarget() {
+  return { kind: 'server', name: selfHostedServer.name, url: selfHostedServer.url };
+}
+
+/**
+ * Opens the configured self-hosted server in its own tab. The server is only
+ * probed, never installed or started: if it does not answer, the tab explains
+ * that and Refresh tries again. Concurrent calls (a double click, Refresh while
+ * the start-up open is still probing) share one attempt, so a slow failing probe
+ * cannot overwrite a page that a later attempt has already loaded.
+ */
+function openSelfHostedServerInDesktop() {
+  if (!selfHostedOpenInFlight) {
+    selfHostedOpenInFlight = openSelfHostedServerOnce()
+      .finally(() => { selfHostedOpenInFlight = null; });
+  }
+  return selfHostedOpenInFlight;
+}
+
+/**
+ * Runs one drawing step of the self-hosted tab. Returns false when the user left
+ * the tab (closed it or switched away) before or during the step; a load that
+ * fails because its view was destroyed by that close is not an error to report.
+ */
+async function drawSelfHostedStep(tabId, draw) {
+  if (tabs.activeTabId !== tabId) return false;
+  try {
+    await draw();
+  } catch (error) {
+    if (tabs.activeTabId !== tabId) return false;
+    throw error;
+  }
+  return true;
+}
+
+async function openSelfHostedServerOnce() {
+  if (!selfHostedServer) {
+    throw new Error(selfHostedServerError || 'No self-hosted CloudCLI server is configured.');
+  }
+
+  const target = getSelfHostedTarget();
+  const tabId = tabs.getTabIdForTarget(target);
+  if (desktopWindow.isTargetLoaded(target)) {
+    await desktopWindow.showTarget(target);
+    return getDesktopState();
+  }
+
+  tabs.upsertTarget(target);
+  setActiveTarget(target);
+  const connecting = await drawSelfHostedStep(tabId, () => desktopWindow.showTabPlaceholder(
+    target,
+    `Connecting to ${target.name}...`,
+    [`Checking ${target.url}/health`],
+  ));
+  desktopWindow.emitDesktopState();
+  if (!connecting) return getDesktopState();
+
+  const reachable = await probeSelfHostedServer(target.url);
+  // The probe takes up to several seconds. If the user closed the tab or moved to
+  // another one meanwhile, every step below is skipped: drawing now would attach a
+  // view over the tab they chose, or resurrect one they closed. Switching back to
+  // the tab loads it through the normal tab path.
+
+  if (!reachable) {
+    await drawSelfHostedStep(tabId, () => desktopWindow.showTabPlaceholder(target, `${target.name} is not reachable from this computer.`, [
+      `${target.url}/health did not answer.`,
+      '',
+      'Self-hosted servers are usually reachable only from their own network.',
+      'Away from it, connect the VPN that reaches it (for example Tailscale),',
+      'then press Refresh in the title bar, or choose Environment > Open ' + target.name + '.',
+    ]));
+    desktopWindow.emitDesktopState();
+    return getDesktopState();
+  }
+
+  await drawSelfHostedStep(tabId, () => desktopWindow.showTarget(target));
+  return getDesktopState();
+}
+
+async function reloadActiveTab() {
+  const activeTab = tabs.getActiveTab();
+  if (activeTab?.kind === 'server' && selfHostedServer && !desktopWindow.isTargetLoaded(getSelfHostedTarget())) {
+    return openSelfHostedServerInDesktop();
+  }
+  return desktopWindow.reloadActiveTab();
+}
+
+function isSelfHostedUrl(url) {
+  if (!selfHostedServer) return false;
+  try {
+    return new URL(url).origin === selfHostedServer.url;
+  } catch {
+    return false;
+  }
+}
+
 async function openEnvironmentInDesktop(environment) {
   const pendingTarget = getEnvironmentTarget(environment);
   const tabId = tabs.getTabIdForTarget(pendingTarget);
@@ -656,7 +791,9 @@ async function openNotificationTarget({ environmentUrl, sessionId = null }) {
   }
 
   const environment = findEnvironmentByUrl(environmentUrl);
-  if (environment) {
+  if (isSelfHostedUrl(environmentUrl)) {
+    await openSelfHostedServerInDesktop();
+  } else if (environment) {
     await openEnvironmentInDesktop(environment);
   } else {
     const parsed = new URL(environmentUrl);
@@ -742,13 +879,14 @@ function registerIpcHandlers() {
     return openEnvironmentInDesktop(environment);
   });
   ipcMain.handle('cloudcli-desktop:open-local', async () => openLocalInDesktop());
+  ipcMain.handle('cloudcli-desktop:open-self-hosted-server', async () => openSelfHostedServerInDesktop());
   ipcMain.handle('cloudcli-desktop:open-local-web-ui', async () => openLocalWebUi());
   ipcMain.handle('cloudcli-desktop:refresh-environments', async () => {
     await refreshCloudEnvironments({ showErrors: true });
     return getDesktopState();
   });
   ipcMain.handle('cloudcli-desktop:disconnect-cloud', async () => clearCloudAccount());
-  ipcMain.handle('cloudcli-desktop:reload-active-tab', async () => desktopWindow.reloadActiveTab());
+  ipcMain.handle('cloudcli-desktop:reload-active-tab', async () => reloadActiveTab());
   ipcMain.handle('cloudcli-desktop:show-environment-picker', async () => showEnvironmentPicker());
   ipcMain.handle('cloudcli-desktop:show-launcher', async () => {
     await desktopWindow.showLauncher();
@@ -829,6 +967,8 @@ async function createDesktopWindow() {
     getRemoteEnvironmentMenuItems,
     getCloudState,
     getLocalState,
+    getSelfHostedServer: () => selfHostedServer,
+    getTrustedOrigins: () => getSelfHostedOrigins(selfHostedServer),
     tabs,
     actions: {
       copyDiagnostics,
@@ -844,6 +984,7 @@ async function createDesktopWindow() {
       openLocalInDesktop,
       openLocalWebUi,
       openCloudDashboard,
+      openSelfHostedServer: openSelfHostedServerInDesktop,
       refreshCloudEnvironments: () => refreshCloudEnvironments({ showErrors: true }),
       setActiveTarget,
       showEnvironmentPicker,
@@ -915,9 +1056,9 @@ async function bootstrap() {
     settingsPath: getDesktopNotificationsSettingsPath(),
     appVersion: app.getVersion(),
     appName: APP_NAME,
-    getDeviceId: () => cloud.getAccount()?.deviceId || '',
+    getDeviceId: getNotificationDeviceId,
     getAccountEmail: () => cloud.getAccount()?.email || null,
-    getRunningEnvironmentUrls,
+    getRunningEnvironmentUrls: getNotificationTargetUrls,
     getApiKey: () => cloud.getAccount()?.apiKey || '',
     getAuthToken: getEnvironmentAuthToken,
     getIconPath: getWindowIconPath,
@@ -928,12 +1069,27 @@ async function bootstrap() {
   await localServer.loadDesktopSettings();
   await cloud.loadCloudAccount();
   await desktopNotifications.loadSettings();
+  try {
+    selfHostedServer = await resolveSelfHostedServer({
+      userDataPath: app.getPath('userData'),
+      appRoot: getAppRoot(),
+    });
+  } catch (error) {
+    selfHostedServerError = error instanceof Error ? error.message : String(error);
+  }
 
   registerProtocolHandler();
   registerIpcHandlers();
   registerAppEvents();
   await createDesktopWindow();
   void refreshCloudEnvironments({ showErrors: false });
+
+  if (selfHostedServerError) {
+    void showError('Self-hosted server configuration is invalid', new Error(selfHostedServerError));
+  } else if (selfHostedServer) {
+    void openSelfHostedServerInDesktop()
+      .catch((error) => showError(`Could not open ${selfHostedServer.name}`, error));
+  }
 }
 
 if (registerSingleInstance()) {

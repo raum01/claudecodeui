@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -28,7 +29,26 @@ const LOCAL_SERVER_PORT_ENV_KEYS = [
 
 function requestJson(url, timeoutMs = HEALTH_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const req = http.get(url, { timeout: timeoutMs }, (res) => {
+    let settled = false;
+    let req = null;
+    // `timeout` on the request only fires after the socket has been idle, so a
+    // server that keeps trickling bytes would hold the probe open forever. This
+    // deadline bounds the whole request.
+    const deadline = setTimeout(() => {
+      req?.destroy();
+      finish({ ok: false, json: null });
+    }, timeoutMs);
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(result);
+    }
+
+    // Candidate URLs may be https (see addCandidateUrl); http.get throws
+    // ERR_INVALID_PROTOCOL on those instead of reporting "not reachable".
+    const client = String(url).startsWith('https:') ? https : http;
+    req = client.get(url, { timeout: timeoutMs }, (res) => {
       let body = '';
 
       res.setEncoding('utf8');
@@ -37,26 +57,26 @@ function requestJson(url, timeoutMs = HEALTH_TIMEOUT_MS) {
       });
       res.on('end', () => {
         try {
-          resolve({
+          finish({
             ok: res.statusCode >= 200 && res.statusCode < 300,
             json: JSON.parse(body),
           });
         } catch {
-          resolve({ ok: false, json: null });
+          finish({ ok: false, json: null });
         }
       });
     });
 
     req.on('timeout', () => {
       req.destroy();
-      resolve({ ok: false, json: null });
+      finish({ ok: false, json: null });
     });
-    req.on('error', () => resolve({ ok: false, json: null }));
+    req.on('error', () => finish({ ok: false, json: null }));
   });
 }
 
-async function isCloudCliServer(baseUrl) {
-  const response = await requestJson(`${baseUrl}/health`);
+async function isCloudCliServer(baseUrl, timeoutMs = HEALTH_TIMEOUT_MS) {
+  const response = await requestJson(`${baseUrl}/health`, timeoutMs);
   return response.ok
     && response.json?.status === 'ok'
     && typeof response.json?.installMode === 'string';
@@ -546,4 +566,4 @@ export class LocalServerController {
   }
 }
 
-export { DEFAULT_PORT, HOST };
+export { DEFAULT_PORT, HOST, isCloudCliServer };

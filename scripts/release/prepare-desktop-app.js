@@ -7,6 +7,10 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..', '..');
 const stageDir = path.join(rootDir, '.desktop-build', 'desktop-app');
+// Build-time default for the self-hosted server the app opens
+// (electron/selfHostedServer.js). Unset means the app has none built in.
+const BUNDLED_SERVER_URL_ENV_KEY = 'CLOUDCLI_DESKTOP_BUNDLED_SERVER_URL';
+const SELF_HOSTED_SERVER_FILE = path.join('electron', 'self-hosted-server.json');
 
 const packageJson = JSON.parse(
   await fs.readFile(path.join(rootDir, 'package.json'), 'utf8'),
@@ -64,6 +68,46 @@ async function copyNodeModule(packageName) {
   return true;
 }
 
+// Unit tests live beside the Electron sources; they have no place in the app.
+async function removeTestFiles(dir) {
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await removeTestFiles(entryPath);
+    } else if (/\.test\.[cm]?js$/.test(entry.name)) {
+      await fs.rm(entryPath);
+    }
+  }
+}
+
+function normalizeServerOrigin(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(`${BUNDLED_SERVER_URL_ENV_KEY} is not a URL: ${JSON.stringify(rawUrl)}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`${BUNDLED_SERVER_URL_ENV_KEY} must be http(s): ${JSON.stringify(rawUrl)}`);
+  }
+  if (parsed.pathname !== '/') {
+    throw new Error(`${BUNDLED_SERVER_URL_ENV_KEY} must be a site root with no path: ${JSON.stringify(rawUrl)}`);
+  }
+  return parsed.origin;
+}
+
+// The staged file is always derived from the environment, never copied from a
+// developer's working tree, so a build cannot silently inherit someone's server.
+async function writeBundledServerConfig() {
+  const target = path.join(stageDir, SELF_HOSTED_SERVER_FILE);
+  await fs.rm(target, { force: true });
+  const rawUrl = process.env[BUNDLED_SERVER_URL_ENV_KEY];
+  if (!rawUrl || !rawUrl.trim()) return;
+  const url = normalizeServerOrigin(rawUrl.trim());
+  await fs.writeFile(target, `${JSON.stringify({ url }, null, 2)}\n`, 'utf8');
+  console.log(`Bundled self-hosted server: ${url}`);
+}
+
 function buildDesktopPackageJson(copiedOptionalDependencies) {
   return {
     name: `${packageJson.name}-desktop`,
@@ -110,6 +154,8 @@ await fs.rm(stageDir, { recursive: true, force: true });
 await fs.mkdir(stageDir, { recursive: true });
 
 await copyRequired('electron');
+await removeTestFiles(path.join(stageDir, 'electron'));
+await writeBundledServerConfig();
 await copyRequired('dist');
 await copyRequired('public');
 

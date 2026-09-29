@@ -1,6 +1,8 @@
 import { BrowserView } from 'electron';
 
 const TARGET_LOAD_TIMEOUT_MS = 20000;
+// Must match the prefix parsed in preload.cjs.
+const TRUSTED_ORIGINS_ARG_PREFIX = '--cloudcli-trusted-origins=';
 
 function escapeHtml(value) {
   return String(value == null ? '' : value)
@@ -69,11 +71,12 @@ async function loadUrlWithTimeout(webContents, url, timeoutMs = TARGET_LOAD_TIME
 }
 
 export class ViewHost {
-  constructor({ appName, getMainWindow, getContentViewBounds, getPreloadPath, openExternalUrl, showError }) {
+  constructor({ appName, getMainWindow, getContentViewBounds, getPreloadPath, getTrustedOrigins = () => [], openExternalUrl, showError }) {
     this.appName = appName;
     this.getMainWindow = getMainWindow;
     this.getContentViewBounds = getContentViewBounds;
     this.getPreloadPath = getPreloadPath;
+    this.getTrustedOrigins = getTrustedOrigins;
     this.openExternalUrl = openExternalUrl;
     this.showError = showError;
     this.activeContentView = null;
@@ -201,12 +204,18 @@ export class ViewHost {
     let view = this.tabViews.get(tabId);
     if (view) return view;
 
+    // The sandboxed preload cannot read the app's settings, so the origins it
+    // should expose the desktop bridge to travel as a renderer argument.
+    const trustedOrigins = this.getTrustedOrigins();
     view = new BrowserView({
       webPreferences: {
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
         preload: this.getPreloadPath(),
+        additionalArguments: trustedOrigins.length
+          ? [`${TRUSTED_ORIGINS_ARG_PREFIX}${trustedOrigins.join(',')}`]
+          : [],
       },
     });
     this.configureChildWebContents(view.webContents);
@@ -239,10 +248,10 @@ export class ViewHost {
     }
   }
 
-  async showTabPlaceholder(tabId, target, message) {
+  async showTabPlaceholder(tabId, target, message, details = []) {
     const view = this.getOrCreateTabView(tabId);
     this.attach(view);
-    const html = buildPlaceholderHtml(target.name || this.appName, message);
+    const html = buildPlaceholderHtml(target.name || this.appName, message, details);
     await view.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
     view.__cloudcliStartupHtml = html;
     view.__cloudcliLoadedUrl = null;
@@ -281,6 +290,13 @@ export class ViewHost {
       }
     }
     return view.webContents.getURL();
+  }
+
+  /** True when the tab's view has finished loading `url` (not a placeholder). */
+  isTabLoaded(tabId, url) {
+    const view = this.tabViews.get(tabId);
+    if (!view || view.webContents.isDestroyed()) return false;
+    return view.__cloudcliLoadedUrl === url;
   }
 
   reloadTab(tabId) {

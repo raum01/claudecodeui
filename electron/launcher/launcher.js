@@ -34,6 +34,7 @@ window.__MOCK_STATE__ = {
       mockState.activeTarget = { kind: 'local', name: 'Local CloudCLI', url: mockState.localWebUrl };
       return Promise.resolve(clone(mockState));
     },
+    openSelfHostedServer: function () { return Promise.resolve(clone(mockState)); },
     openLocalWebUi: function () {
       mockState.localServerRunning = true;
       return Promise.resolve(clone(mockState));
@@ -295,6 +296,8 @@ window.__MOCK_STATE__ = {
     switch (name) {
       case 'local':
         return CC.run('Starting Local CloudCLI...', function () { return bridge.openLocal(); });
+      case 'open-server':
+        return CC.run('Connecting to your server...', function () { return bridge.openSelfHostedServer(); });
       case 'connect':
         return CC.run('Opening cloudcli.ai to connect your account...', function () { return bridge.connectCloud(); });
       case 'logout':
@@ -354,7 +357,7 @@ window.__MOCK_STATE__ = {
     if (!activeEnvironmentId && activeTab && /^remote:/.test(activeTab.id || '')) {
       activeEnvironmentId = activeTab.id.replace(/^remote:/, '');
     }
-    var activeRefreshable = (state.activeTarget && (state.activeTarget.kind === 'remote' || state.activeTarget.kind === 'local')) ||
+    var activeRefreshable = (state.activeTarget && (state.activeTarget.kind === 'remote' || state.activeTarget.kind === 'local' || state.activeTarget.kind === 'server')) ||
       (activeTab && activeTab.id !== 'home');
     var envActions = activeEnvironmentId ? '<button class="btn sm tb-action no-drag" data-cc-action="env-row-menu" data-cc-environment-id="' + esc(activeEnvironmentId) + '" title="Open environment actions">Open environment in...</button>' : '';
     var refreshAction = activeRefreshable ? '<button class="icon-btn tb-action no-drag" data-cc-action="refresh-tab" title="Refresh tab">' + icon('refresh', 16) + '</button>' : '';
@@ -632,6 +635,18 @@ window.__MOCK_STATE__ = {
       '<div class="card-actions"><button class="btn pri" data-cc-action="local">' + CC.icon('play', 15) + 'Open Local CloudCLI</button><button class="btn" data-cc-action="open-web">' + CC.icon('arrow', 14) + 'Open in browser</button><button class="btn" data-cc-action="copy-web">' + CC.icon('copy', 14) + 'Copy URL</button></div></div>';
   }
 
+  function serverPane(state) {
+    var server = state.selfHostedServer || {};
+    var header = '<div class="pane-h"><div><h2 class="pane-title">Self-hosted server</h2><p class="pane-sub">CloudCLI running on another machine you own. This app only connects to it.</p></div></div>';
+    if (!server.configured) {
+      return header + '<div class="empty">' + CC.esc(server.error || 'No self-hosted server is configured.') + '</div>';
+    }
+    return header +
+      '<div class="card"><div class="card-head"><div><div class="card-t">' + CC.esc(server.name) + '</div><div class="card-sub mono">' + CC.esc(server.url) + '</div></div><div class="card-tools"><span class="dot" style="background:' + (server.loaded ? 'var(--ok)' : 'var(--tx3)') + '"></span></div></div>' +
+      '<div class="card-actions"><button class="btn pri" data-cc-action="open-server">' + CC.icon('arrow', 15) + 'Open ' + CC.esc(server.name) + '</button></div>' +
+      '<div class="card-sub">Configured by ' + CC.esc(server.source) + '</div></div>';
+  }
+
   function envRow(environment) {
     var meta = CC.statusMeta(environment.status);
     var tags = (environment.agent ? '<span class="tag">' + CC.esc(environment.agent) + '</span>' : '') + (environment.region ? '<span class="tag">' + CC.esc(environment.region) + '</span>' : '');
@@ -661,13 +676,17 @@ window.__MOCK_STATE__ = {
   }
 
   function renderBody(state) {
-    var section = CC.ui.section || ((CC.connected(state) || CC.authState(state) === 'expired') ? 'cloud' : 'local');
+    var server = state.selfHostedServer || {};
+    var hasServer = Boolean(server.configured || server.error);
+    var section = CC.ui.section || (hasServer ? 'server' : ((CC.connected(state) || CC.authState(state) === 'expired') ? 'cloud' : 'local'));
     CC.ui.section = section;
     var nav = '<div class="sb"><div class="sb-grp"><div class="lbl">Launcher</div>' +
+      (hasServer ? navItem('server', 'arrow', 'Self-hosted server', server.loaded ? 'open' : '', section) : '') +
       navItem('local', 'terminal', 'Local servers', state.localServerRunning ? 'on' : 'idle', section) +
       navItem('cloud', 'cloud', 'Cloud environments', (state.environments || []).length, section) +
       '</div></div>';
-    return nav + '<div class="sb-main">' + (section === 'local' ? localPane(state) : cloudPane(state)) + '</div>';
+    var pane = section === 'server' ? serverPane(state) : (section === 'local' ? localPane(state) : cloudPane(state));
+    return nav + '<div class="sb-main">' + pane + '</div>';
   }
 
   function onClick(event) {

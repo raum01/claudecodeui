@@ -4,10 +4,13 @@ import { ViewHost } from './viewHost.js';
 
 const TITLEBAR_HEIGHT = 44;
 const AUTH_TOKEN_STORAGE_KEY = 'auth-token';
-function isAllowedPermissionOrigin(sourceUrl, controlPlaneUrl) {
+function isAllowedPermissionOrigin(sourceUrl, controlPlaneUrl, trustedOrigins = []) {
   try {
     const source = new URL(sourceUrl);
     if ((source.hostname === '127.0.0.1' || source.hostname === 'localhost') && source.protocol === 'http:') {
+      return true;
+    }
+    if (trustedOrigins.includes(source.origin)) {
       return true;
     }
     if (source.protocol !== 'https:') {
@@ -39,6 +42,8 @@ export class DesktopWindowManager {
     getRemoteEnvironmentMenuItems,
     getCloudState,
     getLocalState,
+    getSelfHostedServer = () => null,
+    getTrustedOrigins = () => [],
     actions,
     tabs,
   }) {
@@ -52,6 +57,8 @@ export class DesktopWindowManager {
     this.getRemoteEnvironmentMenuItems = getRemoteEnvironmentMenuItems;
     this.getCloudState = getCloudState;
     this.getLocalState = getLocalState;
+    this.getSelfHostedServer = getSelfHostedServer;
+    this.getTrustedOrigins = getTrustedOrigins;
     this.actions = actions;
     this.tabs = tabs;
 
@@ -64,6 +71,7 @@ export class DesktopWindowManager {
       getMainWindow: () => this.mainWindow,
       getContentViewBounds: () => this.getContentViewBounds(),
       getPreloadPath: this.getPreloadPath,
+      getTrustedOrigins: this.getTrustedOrigins,
       openExternalUrl: this.openExternalUrl,
       showError: this.actions.showError,
     });
@@ -93,9 +101,13 @@ export class DesktopWindowManager {
     this.viewHost.detachAll();
   }
 
-  async showTabPlaceholder(target, message) {
+  async showTabPlaceholder(target, message, details = []) {
     const tabId = this.tabs.getTabIdForTarget(target);
-    await this.viewHost.showTabPlaceholder(tabId, target, message);
+    await this.viewHost.showTabPlaceholder(tabId, target, message, details);
+  }
+
+  isTargetLoaded(target) {
+    return this.viewHost.isTabLoaded(this.tabs.getTabIdForTarget(target), target.url);
   }
 
   async showLocalStartupTarget(target, logs) {
@@ -386,6 +398,20 @@ export class DesktopWindowManager {
     return items;
   }
 
+  buildSelfHostedServerMenuItems() {
+    const server = this.getSelfHostedServer();
+    if (!server) return [];
+    return [
+      {
+        label: `Open ${server.name}`,
+        accelerator: 'CmdOrCtrl+Shift+O',
+        click: () => void this.actions.openSelfHostedServer()
+          .catch((error) => this.actions.showError(`Could not open ${server.name}`, error)),
+      },
+      { type: 'separator' },
+    ];
+  }
+
   buildTrayEnvironmentSection() {
     const cloudState = this.getCloudState();
     if (!cloudState.account?.apiKey) {
@@ -468,6 +494,7 @@ export class DesktopWindowManager {
             click: () => void this.actions.showEnvironmentPicker().catch((error) => this.actions.showError('Could not switch environment', error)),
           },
           { type: 'separator' },
+          ...this.buildSelfHostedServerMenuItems(),
           {
             label: 'Open Local CloudCLI',
             accelerator: 'CmdOrCtrl+L',
@@ -600,6 +627,7 @@ export class DesktopWindowManager {
     const localState = this.getLocalState();
 
     const template = [
+      ...this.buildSelfHostedServerMenuItems(),
       {
         label: 'Local',
         submenu: [
@@ -678,18 +706,22 @@ export class DesktopWindowManager {
   }
 
   configurePermissions() {
-    const isAllowedPermission = (webContents, permission) => {
-      const sourceUrl = webContents.getURL();
-      const allowedPermissions = new Set(['clipboard-read', 'media', 'notifications']);
-      return isAllowedPermissionOrigin(sourceUrl, this.getCloudState().controlPlaneUrl) && allowedPermissions.has(permission);
-    };
+    const allowedPermissions = new Set(['clipboard-read', 'media', 'notifications']);
+    const isAllowedPermission = (sourceUrl, permission) => (
+      isAllowedPermissionOrigin(sourceUrl, this.getCloudState().controlPlaneUrl, this.getTrustedOrigins())
+        && allowedPermissions.has(permission)
+    );
 
-    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-      callback(isAllowedPermission(webContents, permission));
+    // Judge the frame that asks, not the page that contains it. webContents.getURL()
+    // is the top-level page, so an iframe of any origin inside a trusted page would
+    // otherwise inherit its permissions (measured: a https://example.com iframe in
+    // the self-hosted server's page was granted notifications).
+    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+      callback(isAllowedPermission(details?.requestingUrl || webContents.getURL(), permission));
     });
-    session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
+    session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
       if (!webContents) return false;
-      return isAllowedPermission(webContents, permission);
+      return isAllowedPermission(requestingOrigin || webContents.getURL(), permission);
     });
   }
 

@@ -1,7 +1,16 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Origins of a configured self-hosted server, passed by viewHost.js as a
+// renderer argument because a sandboxed preload cannot read app settings.
+const TRUSTED_ORIGINS_ARG_PREFIX = '--cloudcli-trusted-origins=';
+const trustedOrigins = (process.argv || [])
+  .filter((arg) => arg.startsWith(TRUSTED_ORIGINS_ARG_PREFIX))
+  .flatMap((arg) => arg.slice(TRUSTED_ORIGINS_ARG_PREFIX.length).split(','))
+  .filter(Boolean);
+
 function isCloudCliAppOrigin(location) {
   if (location.protocol === 'file:') return true;
+  if (trustedOrigins.includes(location.origin)) return true;
 
   if (location.protocol === 'http:') {
     return location.hostname === '127.0.0.1' || location.hostname === 'localhost';
@@ -39,6 +48,7 @@ if (window.location.protocol === 'file:') {
     openEnvironment: (environmentId) => ipcRenderer.invoke('cloudcli-desktop:open-environment', environmentId),
     runActiveEnvironmentAction: (action) => ipcRenderer.invoke('cloudcli-desktop:run-active-environment-action', action),
     openLocal: () => ipcRenderer.invoke('cloudcli-desktop:open-local'),
+    openSelfHostedServer: () => ipcRenderer.invoke('cloudcli-desktop:open-self-hosted-server'),
     openLocalWebUi: () => ipcRenderer.invoke('cloudcli-desktop:open-local-web-ui'),
     refreshEnvironments: () => ipcRenderer.invoke('cloudcli-desktop:refresh-environments'),
     refreshActiveTab: () => ipcRenderer.invoke('cloudcli-desktop:reload-active-tab'),
